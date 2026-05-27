@@ -170,6 +170,9 @@ async function processNewFilesInSourceFolder_() {
 
       let displayTitle = 'ナンバリングなし';
       let numberedFileName = fileName;
+      // ナンバリングが失敗した場合に、成功通知・メール送信・notifiedIds 追加をすべてスキップするためのフラグ。
+      // 失敗時は notifiedIds に積まず、processing_* cache が10分で期限切れになった次のサイクルで自動再試行される。
+      let numberingFailed = false;
 
       if (file.getMimeType() === MimeType.PDF) {
         try {
@@ -180,12 +183,27 @@ async function processNewFilesInSourceFolder_() {
           console.error(`PDF編集エラー: ${err.message}`);
           console.error(err.stack);
 
-          sendToSlack({
-            text: `⚠️ PDF編集エラーが発生しました\n\`\`\`${err.message}\n${err.stack}\`\`\``,
-            channel: CONFIG.CHANNEL_ID
-          });
-          displayTitle = 'エラー発生';
+          // 同じファイルが連続失敗した場合に Slack が荒れないよう、30分のスロットリングをかける。
+          const alertCacheKey = 'alerted_numbering_' + fileId;
+          if (!cache.get(alertCacheKey)) {
+            sendToSlack({
+              text: `⚠️ PDF編集エラー（10分後に自動再試行されます）\n*ファイル:* ${fileName}\n\`\`\`${err.message}\n${err.stack}\`\`\``,
+              channel: CONFIG.CHANNEL_ID
+            });
+            cache.put(alertCacheKey, 'true', 1800); // 30分
+          } else {
+            console.log(`Slackアラートは30分以内に通知済みのためスキップ: ${fileName}`);
+          }
+          numberingFailed = true;
         }
+      }
+
+      // ナンバリング失敗時は通知・メール・notifiedIds 追加をすべてスキップして次ファイルへ。
+      // 10分後に processing_* cache が切れた次サイクルで自動再試行される。
+      // 番号は applyNumberingToPdf 内の PENDING_NUMBERS_* キャッシュで再利用されるため浪費しない。
+      if (numberingFailed) {
+        console.warn(`ナンバリング失敗のため通知・メール・notifiedIds をスキップ: ${fileName}（10分後に自動再試行・番号は再利用）`);
+        continue;
       }
 
       sendToSlack({
@@ -286,13 +304,41 @@ function allocateNumbers(pageCount) {
 
 // 引数は file だけになります
 async function applyNumberingToPdf(file) {
+  const fileId = file.getId();
   const blob = file.getBlob();
   const bytes = new Uint8Array(blob.getBytes());
   const pdfDoc = await PDFLib.PDFDocument.load(bytes);
   const pages = pdfDoc.getPages();
   const pageCount = pages.length;
 
-  const numbers = allocateNumbers(pageCount);
+  // 番号再利用キャッシュ: 同じ fileId に対して既に番号を割り当てていれば再利用する。
+  // 目的: アップロード失敗のたびに allocateNumbers でカウンタが進み、番号が虚しく飛ぶのを防ぐ。
+  const props = PropertiesService.getScriptProperties();
+  const pendingKey = 'PENDING_NUMBERS_' + fileId;
+  const PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7日より古い残骸は無視
+
+  let numbers = null;
+  const pendingJson = props.getProperty(pendingKey);
+  if (pendingJson) {
+    try {
+      const pending = JSON.parse(pendingJson);
+      const isFresh = pending.savedAt && (Date.now() - pending.savedAt) < PENDING_TTL_MS;
+      if (isFresh && pending.pageCount === pageCount && Array.isArray(pending.numbers)) {
+        numbers = pending.numbers;
+        console.log(`[applyNumberingToPdf] 既存の番号割当を再利用: ${fileId} → ${numbers[0]} 〜 ${numbers[numbers.length - 1]}`);
+      }
+    } catch (parseErr) {
+      console.warn(`[applyNumberingToPdf] PENDING_NUMBERS パース失敗（新規割当へ）: ${parseErr.message}`);
+    }
+  }
+  if (!numbers) {
+    numbers = allocateNumbers(pageCount);
+    props.setProperty(pendingKey, JSON.stringify({
+      pageCount: pageCount,
+      numbers: numbers,
+      savedAt: Date.now()
+    }));
+  }
 
   const standardFont = await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica);
   const fontSize = 14;
@@ -312,7 +358,11 @@ async function applyNumberingToPdf(file) {
   const newBlob = Utilities.newBlob(pdfBytes, 'application/pdf', file.getName());
   // 大容量PDF（25MB+の高解像度スキャン）で発生する "Empty response" 対策として、
   // リトライ + 冪等チェック + resumable upload を内包したヘルパー経由で更新する。
-  driveUpdateWithRetry_(file.getId(), newBlob, file.getName());
+  driveUpdateWithRetry_(fileId, newBlob, file.getName());
+
+  // アップロードが本当に成功したときだけ番号割当キャッシュをクリアする。
+  // 失敗で例外が投げられればここには到達せず、次回リトライで同じ番号が再利用される。
+  props.deleteProperty(pendingKey);
 
   if (pageCount === 1) {
     return numbers[0];
@@ -345,6 +395,15 @@ function driveUpdateWithRetry_(fileId, blob, fileName) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // 更新前の lastUpdated をベースラインとして記録（Empty response の真贋判定に使う）。
+    // スキャナが直前に書き込んだ直後でも、絶対時刻ではなく「進んだかどうか」で判定するため誤検知しない。
+    let preUpdateMs = null;
+    try {
+      preUpdateMs = DriveApp.getFileById(fileId).getLastUpdated().getTime();
+    } catch (preErr) {
+      console.warn(`[driveUpdateWithRetry_] 更新前 lastUpdated 取得失敗（冪等チェックなしで続行）: ${preErr.message}`);
+    }
+
     try {
       if (useResumable) {
         updatePdfResumable_(fileId, blob);
@@ -360,20 +419,22 @@ function driveUpdateWithRetry_(fileId, blob, fileName) {
       const msg = String((e && e.message) || e);
       const isEmpty = /Empty response/i.test(msg);
 
-      // Empty response は実は成功している場合がある。
-      // Drive の lastUpdated が直近なら成功とみなしてリトライをスキップ。
-      if (isEmpty) {
-        Utilities.sleep(2000);
+      // Empty response の真贋判定:
+      // 更新前(preUpdateMs)と更新後(postUpdateMs)を比較して、確実に「進んでいる」ときだけ成功扱い。
+      // スキャナが書き込んだだけで preUpdateMs が新しい状態でも、update が本当に失敗していれば
+      // postUpdateMs は preUpdateMs と同じになる（≒変化なし）ので、確実に失敗と判定できる。
+      if (isEmpty && preUpdateMs !== null) {
+        Utilities.sleep(2000); // Drive のメタデータ反映待ち
         try {
-          const file = DriveApp.getFileById(fileId);
-          const lastUpdated = file.getLastUpdated();
-          const ageSec = (Date.now() - lastUpdated.getTime()) / 1000;
-          if (ageSec < 60) {
-            console.log(`[driveUpdateWithRetry_] Empty response でしたが lastUpdated=${ageSec.toFixed(1)}s前のため成功とみなします (${fileName}, ${sizeMb}MB)`);
+          const postFile = DriveApp.getFileById(fileId);
+          const postUpdateMs = postFile.getLastUpdated().getTime();
+          if (postUpdateMs > preUpdateMs) {
+            console.log(`[driveUpdateWithRetry_] Empty response だが lastUpdated が ${new Date(preUpdateMs).toISOString()} → ${new Date(postUpdateMs).toISOString()} に進んだので成功と判定 (${fileName}, ${sizeMb}MB)`);
             return;
           }
+          console.log(`[driveUpdateWithRetry_] Empty response: lastUpdated 変化なし(${new Date(preUpdateMs).toISOString()}) → 本当に失敗と判定しリトライへ (${fileName}, ${sizeMb}MB)`);
         } catch (checkErr) {
-          console.warn(`[driveUpdateWithRetry_] 冪等チェックに失敗: ${checkErr.message}`);
+          console.warn(`[driveUpdateWithRetry_] 更新後 lastUpdated 取得失敗（保守的にリトライへ）: ${checkErr.message}`);
         }
       }
 
