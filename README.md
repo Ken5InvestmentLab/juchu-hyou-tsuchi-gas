@@ -4,7 +4,7 @@
 
 - **GASプロジェクト**: [`1a6p3b59-9hyQmvksBJcFYZlq94TArFg3E7RBYfFBzzR2YTnqRE0O87nF`](https://script.google.com/home/projects/1a6p3b59-9hyQmvksBJcFYZlq94TArFg3E7RBYfFBzzR2YTnqRE0O87nF/edit)
 - **ローカル**: `C:\Users\ken5\OneDrive\Desktop\Product\受注表通知GAS\`
-- **GitHub**: `Ken5InvestmentLab/受注表通知GAS`（Private）
+- **GitHub**: [`Ken5InvestmentLab/juchu-hyou-tsuchi-gas`](https://github.com/Ken5InvestmentLab/juchu-hyou-tsuchi-gas)（Private）
 
 ## ファイル
 
