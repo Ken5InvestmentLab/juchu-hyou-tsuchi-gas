@@ -1,0 +1,15 @@
+# clasp は appsscript.json / .js / .gs / .html のみ push する
+**/**
+!appsscript.json
+!*.js
+!*.gs
+!*.html
+
+# 念のため明示的に除外
+README.md
+.gitignore
+.claspignore
+.git/**
+.gitattributes
+node_modules/**
+*.md
