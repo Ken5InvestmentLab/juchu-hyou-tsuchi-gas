@@ -75,6 +75,25 @@ function renewDriveWatcher() {
 // ========== 1分ごとのフォルダ監視でナンバリングを実行 ==========
 
 /**
+ * Google 側で発生する一過性のサーバーエラー（リトライで自然に解消する類のもの）かを判定する。
+ * 該当する場合は Slack 通知をスキップし、未処理ファイルは次の1分後トリガーでの自動再試行に任せる。
+ *   - "We're sorry, a server error occurred" : Apps Script / Drive の汎用一過性エラー
+ *   - "Service error: Drive"                 : Drive API の一過性エラー
+ *   - "Internal error" / "Backend Error"     : Google 内部エラー
+ *   - HTTP 500/502/503/504                   : 5xx 系のサーバーエラー
+ */
+function isTransientGoogleError_(err) {
+  const msg = String((err && err.message) || err);
+  return (
+    /Service error: Drive/i.test(msg) ||
+    /server error occurred/i.test(msg) ||
+    /Internal error/i.test(msg) ||
+    /Backend Error/i.test(msg) ||
+    /\b(500|502|503|504)\b/.test(msg)
+  );
+}
+
+/**
  * 初回だけ手動実行してください。
  * 既存の同名トリガーを削除してから、1分ごとの監視トリガーを1つだけ作成します。
  */
@@ -124,13 +143,15 @@ async function monitorSourceFolderEveryMinute() {
     console.error('monitorSourceFolderEveryMinute 全体エラー: ' + err.message);
     console.error(err.stack);
 
-    // Service error: Drive は無害な一過性エラーのため Slack 通知しない
-    if (!err.message.includes('Service error: Drive')) {
+    // 一過性のGoogle側サーバーエラーは Slack 通知しない。
+    // この時点で例外が出たということは notifiedIds への追加・props保存もされていないため、
+    // 未処理ファイルは次の1分後トリガーで自然に再試行される（番号も PENDING_NUMBERS_* で再利用）。
+    if (!isTransientGoogleError_(err)) {
       sendToSlack({
         text: `?? *システム全体エラー (monitorSourceFolderEveryMinute)*\n発生時刻: ${new Date().toLocaleString('ja-JP')}\n\`\`\`${err.message}\n${err.stack}\`\`\``
       });
     } else {
-      console.log('無害な Drive サービスエラーのため Slack 通知をスキップしました');
+      console.log('無害な一過性エラーのため Slack 通知をスキップ（次サイクルで自動再試行）: ' + err.message);
     }
 
     return 'Error: ' + err.message;
@@ -257,13 +278,13 @@ function doPost(e) {
     console.error('doPost 全体エラー: ' + err.message);
     console.error(err.stack);
 
-    // Service error: Drive は無害な一過性エラーのため Slack 通知しない
-    if (!err.message.includes('Service error: Drive')) {
+    // 一過性のGoogle側サーバーエラーは Slack 通知しない
+    if (!isTransientGoogleError_(err)) {
       sendToSlack({
         text: `?? *システム全体エラー (doPost)*\n発生時刻: ${new Date().toLocaleString('ja-JP')}\n\`\`\`${err.message}\n${err.stack}\`\`\``
       });
     } else {
-      console.log('無害な Drive サービスエラーのため Slack 通知をスキップしました');
+      console.log('無害な一過性エラーのため Slack 通知をスキップしました: ' + err.message);
     }
 
     return ContentService.createTextOutput('Error: ' + err.message);
