@@ -326,10 +326,40 @@ function allocateNumbers(pageCount) {
 // 引数は file だけになります
 async function applyNumberingToPdf(file) {
   const fileId = file.getId();
-  const blob = file.getBlob();
-  const bytes = new Uint8Array(blob.getBytes());
-  const pdfDoc = await PDFLib.PDFDocument.load(bytes);
-  const pages = pdfDoc.getPages();
+  const fileName = file.getName();
+  const prepared = await buildNumberedPdfBlob_(file);
+
+  // PDF解析用の大きなオブジェクトは buildNumberedPdfBlob_ のローカルスコープに閉じ込める。
+  // ヘルパーから戻った時点では出力Blobだけを保持し、解析メモリとアップロードメモリの重複を避ける。
+  driveUpdateWithRetry_(fileId, prepared.blob, fileName, prepared.sizeBytes);
+
+  // アップロードが本当に成功したときだけ番号割当キャッシュをクリアする。
+  // 失敗で例外が投げられればここには到達せず、次回リトライで同じ番号が再利用される。
+  PropertiesService.getScriptProperties().deleteProperty(prepared.pendingKey);
+
+  if (prepared.pageCount === 1) {
+    return prepared.numbers[0];
+  } else {
+    const firstNo = prepared.numbers[0];
+    const lastNoStr = prepared.numbers[prepared.pageCount - 1].split('-').pop();
+    return `${firstNo}~${lastNoStr}`;
+  }
+}
+
+/**
+ * PDFの読込・番号描画・再保存だけを独立スコープで行う。
+ * 戻り値にはアップロードに必要な最小限のデータだけを含め、pdf-lib の解析状態を持ち越さない。
+ *
+ * @param {GoogleAppsScript.Drive.File} file  ナンバリング対象PDF
+ * @returns {Promise<{blob: GoogleAppsScript.Base.Blob, sizeBytes: number, pageCount: number, numbers: string[], pendingKey: string}>}
+ */
+async function buildNumberedPdfBlob_(file) {
+  const fileId = file.getId();
+
+  // getBlob()/getBytes() の一時値を保持し続けず、pdf-lib が必要とする Uint8Array だけを渡す。
+  // 元Blob・Byte[]・Uint8Arrayを別々の変数で同時保持していた従来実装よりピークメモリを抑える。
+  let pdfDoc = await PDFLib.PDFDocument.load(new Uint8Array(file.getBlob().getBytes()));
+  let pages = pdfDoc.getPages();
   const pageCount = pages.length;
 
   // 番号再利用キャッシュ: 同じ fileId に対して既に番号を割り当てていれば再利用する。
@@ -361,7 +391,7 @@ async function applyNumberingToPdf(file) {
     }));
   }
 
-  const standardFont = await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica);
+  let standardFont = await pdfDoc.embedFont(PDFLib.StandardFonts.Helvetica);
   const fontSize = 14;
 
   pages.forEach((page, index) => {
@@ -375,23 +405,23 @@ async function applyNumberingToPdf(file) {
     });
   });
 
-  const pdfBytes = await pdfDoc.save();
+  let pdfBytes = await pdfDoc.save();
+  const sizeBytes = pdfBytes.length;
   const newBlob = Utilities.newBlob(pdfBytes, 'application/pdf', file.getName());
-  // 大容量PDF（25MB+の高解像度スキャン）で発生する "Empty response" 対策として、
-  // リトライ + 冪等チェック + resumable upload を内包したヘルパー経由で更新する。
-  driveUpdateWithRetry_(fileId, newBlob, file.getName());
 
-  // アップロードが本当に成功したときだけ番号割当キャッシュをクリアする。
-  // 失敗で例外が投げられればここには到達せず、次回リトライで同じ番号が再利用される。
-  props.deleteProperty(pendingKey);
+  // 大きな参照を明示的に切り、ヘルパー終了後に回収可能な状態にする。
+  pdfBytes = null;
+  standardFont = null;
+  pages = null;
+  pdfDoc = null;
 
-  if (pageCount === 1) {
-    return numbers[0];
-  } else {
-    const firstNo = numbers[0];
-    const lastNoStr = numbers[pageCount - 1].split('-').pop();
-    return `${firstNo}~${lastNoStr}`;
-  }
+  return {
+    blob: newBlob,
+    sizeBytes: sizeBytes,
+    pageCount: pageCount,
+    numbers: numbers,
+    pendingKey: pendingKey
+  };
 }
 
 /**
@@ -404,9 +434,9 @@ async function applyNumberingToPdf(file) {
  * @param {string} fileId  更新対象のファイルID
  * @param {GoogleAppsScript.Base.Blob} blob  新しい中身
  * @param {string} fileName  ログ用の表示名
+ * @param {number} sizeBytes  PDF保存直後に取得したバイト数
  */
-function driveUpdateWithRetry_(fileId, blob, fileName) {
-  const sizeBytes = blob.getBytes().length;
+function driveUpdateWithRetry_(fileId, blob, fileName, sizeBytes) {
   const RESUMABLE_THRESHOLD = 20 * 1024 * 1024; // 20MB を超えたら resumable へ切替
   const useResumable = sizeBytes >= RESUMABLE_THRESHOLD;
   const sizeMb = (sizeBytes / 1024 / 1024).toFixed(2);
@@ -427,7 +457,7 @@ function driveUpdateWithRetry_(fileId, blob, fileName) {
 
     try {
       if (useResumable) {
-        updatePdfResumable_(fileId, blob);
+        updatePdfResumable_(fileId, blob, sizeBytes);
       } else {
         Drive.Files.update({}, fileId, blob);
       }
@@ -490,13 +520,13 @@ function driveUpdateWithRetry_(fileId, blob, fileName) {
  * 単発 PATCH より接続切断に強く、25MB+ のスキャン PDF で Empty response が出にくい。
  * @param {string} fileId  更新対象のファイルID
  * @param {GoogleAppsScript.Base.Blob} blob  新しい中身
+ * @param {number} sizeBytes  アップロードするBlobのバイト数
  */
-function updatePdfResumable_(fileId, blob) {
+function updatePdfResumable_(fileId, blob, sizeBytes) {
   const token = ScriptApp.getOAuthToken();
   const mimeType = blob.getContentType() || 'application/pdf';
-  const bytes = blob.getBytes();
 
-  // ① セッション開始（メタデータは空でOK・本体は次のPUTで送る）
+  // ① セッション開始（ここでは全バイトを展開せず、メタデータだけ送る）
   const initResp = UrlFetchApp.fetch(
     `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=resumable&supportsAllDrives=true`,
     {
@@ -505,7 +535,7 @@ function updatePdfResumable_(fileId, blob) {
         'Authorization': 'Bearer ' + token,
         'Content-Type': 'application/json; charset=UTF-8',
         'X-Upload-Content-Type': mimeType,
-        'X-Upload-Content-Length': String(bytes.length)
+        'X-Upload-Content-Length': String(sizeBytes)
       },
       payload: '{}',
       muteHttpExceptions: true
@@ -523,11 +553,12 @@ function updatePdfResumable_(fileId, blob) {
     throw new Error('Resumable upload: Location ヘッダーが見つかりませんでした');
   }
 
-  // ② 本体を単発 PUT で送る（GAS は UrlFetchApp で最大50MB送れるため、PDFは1ショットで通る）
+  // ② 本体をBlobのまま単発 PUT で送る。
+  // UrlFetchApp はBlobをpayloadとして直接受け取れるため、blob.getBytes() の全量コピーは不要。
   const uploadResp = UrlFetchApp.fetch(sessionUri, {
     method: 'put',
     headers: { 'Content-Type': mimeType },
-    payload: bytes,
+    payload: blob,
     muteHttpExceptions: true
   });
 
